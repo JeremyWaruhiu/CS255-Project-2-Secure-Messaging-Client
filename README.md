@@ -28,7 +28,7 @@ w24_proj2_source/
 1. Install Node.js (version 18+ recommended).
 2. Run the following commands in the project root:
 
-\\\ash
+\\\
 npm install
 npm test
 \\\
