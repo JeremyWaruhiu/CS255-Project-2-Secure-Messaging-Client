@@ -14,7 +14,7 @@ The implementation follows a simplified Double Ratchet-like scheme focusing on s
 ## Project Structure
 
 
-w24_proj2_source/
+w24_proj2_source/<br>
 ├── lib.js             - Cryptographic primitive wrappers<br>
 ├── messenger.js       - Main implementation file<br>
 ├── question6code/     - ECDSA and RSA test scripts for Question 6<br>
