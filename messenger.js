@@ -1,206 +1,341 @@
 'use strict'
 
-const { subtle } = require('node:crypto').webcrypto
+/** ******* Imports ********/
+
 const {
+  /* The following functions are all of the cryptographic
+  primatives that you should need for this assignment.
+  See lib.js for details on usage. */
   bufferToString,
   genRandomSalt,
-  generateEG,
-  computeDH,
-  verifyWithECDSA,
-  HMACtoAESKey,
-  HMACtoHMACKey,
-  HKDF,
-  encryptWithGCM,
+  generateEG, // async
+  computeDH, // async
+  verifyWithECDSA, // async
+  HMACtoAESKey, // async
+  HMACtoHMACKey, // async
+  HKDF, // async
+  encryptWithGCM, // async
   decryptWithGCM,
-  cryptoKeyToJSON,
+  cryptoKeyToJSON, // async
   govEncryptionDataStr
 } = require('./lib')
 
-function bufToB64 (buf) {
-  return Buffer.from(buf).toString('base64')
-}
+/** ******* Implementation ********/
 
 class MessengerClient {
   constructor (certAuthorityPublicKey, govPublicKey) {
+    // the certificate authority DSA public key is used to
+    // verify the authenticity and integrity of certificates
+    // of other users (see handout and receiveCertificate)
+
+    // you can store data as needed in these objects.
+    // Feel free to modify their structure as you see fit.
     this.caPublicKey = certAuthorityPublicKey
     this.govPublicKey = govPublicKey
-    this.conns = {} // per-peer connection state
-    this.certs = {} // stored certificates
-    this.EGKeyPair = null
-    this.username = null
-  }
-
-  async generateCertificate (username) {
-    this.EGKeyPair = await generateEG()
-    this.username = username
-    const pubJSON = await cryptoKeyToJSON(this.EGKeyPair.pub)
-    return { username, publicKey: pubJSON }
-  }
-
-  async receiveCertificate (certificate, signature) {
-    const certString = JSON.stringify(certificate)
-    const valid = await verifyWithECDSA(this.caPublicKey, certString, signature)
-    if (!valid) throw new Error('Certificate signature invalid')
-    this.certs[certificate.username] = certificate
-  }
-
-  // helper: import peer public key (JWK -> CryptoKey)
-  async _importPeerKey (pubJSON) {
-    return await subtle.importKey(
-      'jwk',
-      pubJSON,
-      { name: 'ECDH', namedCurve: 'P-384' },
-      true,
-      []
-    )
-  }
-
-  // initialize connection state (first time communicating)
-  async _initConn (name, initiator) {
-    if (this.conns[name]) return this.conns[name]
-    const cert = this.certs[name]
-    if (!cert) throw new Error('Missing certificate for ' + name)
-    if (!this.EGKeyPair || !this.EGKeyPair.sec) throw new Error('Local keypair not initialized (call generateCertificate)')
-
-    const theirPub = await this._importPeerKey(cert.publicKey)
-    const shared = await computeDH(this.EGKeyPair.sec, theirPub)
-    const [hk1, hk2] = await HKDF(shared, shared, 'init-ratchet')
-
-    const conn = {
-      sharedSecret: shared,
-      // seeds for HMAC-to-AES per-message derivation
-      sendSeed: initiator ? hk1 : hk2,
-      recvSeed: initiator ? hk2 : hk1,
-      sendCount: 0,
-      recvCount: 0,
-      seen: new Set(),           // replay detection (hashes of ciphertexts)
-      skipped: new Map(),        // map<msgIndex, CryptoKey> for out-of-order messages
-      consumed: new Set()        // set<msgIndex> of message indices we have successfully decrypted
-    }
-
-    this.conns[name] = conn
-    return conn
+    this.conns = {} // data for each active connection
+    this.certs = {} // certificates of other users
+    this.EGKeyPair = {} // keypair from generateCertificate
   }
 
   /**
-   * Send an encrypted message to `name`.
-   * header structure must include: vGov (ephemeral public key CryptoKey),
-   * cGov (ArrayBuffer), ivGov (Uint8Array), receiverIV (Uint8Array), sender (string), msgCount (number)
+   * Helper: Generate a stable string fingerprint for a DH Public Key.
+   * Uses only x and y coordinates to avoid mismatches from metadata (key_ops, etc).
    */
-  async sendMessage (name, plaintext) {
-    if (!this.certs[name]) throw new Error('Missing certificate for ' + name)
-    if (!this.EGKeyPair) throw new Error('Local keypair not initialized (call generateCertificate)')
+  async getFingerprint (cryptoKey) {
+    const jwk = await cryptoKeyToJSON(cryptoKey)
+    return jwk.x + '|' + jwk.y
+  }
 
-    const conn = await this._initConn(name, true)
+  /**
+   * Generate a certificate to be stored with the certificate authority.
+   * The certificate must contain the field "username".
+   *
+   * Arguments:
+   * username: string
+   *
+   * Return Type: certificate object/dictionary
+   */
+  async generateCertificate (username) {
+    this.EGKeyPair = await generateEG()
 
-    // derive per-message AES key from sendSeed and counter
-    const msgIndex = conn.sendCount
-    const msgKey = await HMACtoAESKey(conn.sendSeed, `MSG-${msgIndex}`)
-    const rawMsgKey = await subtle.exportKey('raw', msgKey)
+    const certificate = {
+      username: username,
+      publicKey: this.EGKeyPair.pub
+    }
+    return certificate
+  }
 
-    // Government encryption: ephemeral ECDH with gov public key -> AES key -> encrypt rawMsgKey
-    const eph = await generateEG()
-    const govShared = await computeDH(eph.sec, this.govPublicKey)
-    const govAESKey = await HMACtoAESKey(govShared, govEncryptionDataStr)
+  /**
+   * Receive and store another user's certificate.
+   *
+   * Arguments:
+   * certificate: certificate object/dictionary
+   * signature: ArrayBuffer
+   *
+   * Return Type: void
+   */
+  async receiveCertificate (certificate, signature) {
+    // The signature will be on the output of stringifying the certificate
+    // rather than on the certificate directly.
+    const certString = JSON.stringify(certificate)
 
-    const ivGov = genRandomSalt(12)
-    const cGov = await encryptWithGCM(govAESKey, rawMsgKey, ivGov)
+    const isValid = await verifyWithECDSA(this.caPublicKey, certString, signature)
 
-    const receiverIV = genRandomSalt(12)
-
-    // Build header. vGov must be a CryptoKey (ephemeral public key).
-    const header = {
-      vGov: eph.pub,     // CryptoKey (required by tests' govDecrypt)
-      cGov,              // ArrayBuffer
-      ivGov,             // Uint8Array
-      receiverIV,        // Uint8Array
-      sender: this.username,
-      msgCount: msgIndex
+    if (!isValid) {
+      throw new Error('Certificate signature invalid!')
     }
 
-    // Authenticated data uses JSON.stringify(header) (tests expect that).
-    // JSON.stringify handles non-serializable fields consistently in both sides in this test harness.
-    const headerAuth = JSON.stringify(header)
+    // Store the verified certificate
+    this.certs[certificate.username] = certificate
+  }
 
-    // Encrypt message with message AES key, using receiverIV and headerAuth
-    const ciphertext = await encryptWithGCM(msgKey, plaintext, receiverIV, headerAuth)
+  /**
+   * Generate the message to be sent to another user.
+   *
+   * Arguments:
+   * name: string
+   * plaintext: string
+   *
+   * Return Type: Tuple of [dictionary, ArrayBuffer]
+   */
+  async sendMessage (name, plaintext) {
+    if (!this.certs[name]) {
+      throw new Error(`No certificate found for ${name}`)
+    }
 
-    // advance sending chain: increment counter and ratchet sendSeed
-    conn.sendCount += 1
-    conn.sendSeed = await HMACtoHMACKey(conn.sendSeed, 'chain')
+    // Initialize session state if it doesn't exist
+    if (!this.conns[name]) {
+      this.conns[name] = {
+        RK: null, // Root Key
+        CKs: null, // Chain Key Sending
+        CKr: null, // Chain Key Receiving
+        DHs: null, // My DH KeyPair (Sending)
+        DHr: this.certs[name].publicKey, // Their DH Public Key (Receiving) - initially their Identity Key
+        Ns: 0, // Message Number Sending
+        Nr: 0, // Message Number Receiving
+        PN: 0, // Previous Chain Length
+        skippedKeys: {} // Storage for skipped message keys
+      }
+    }
+
+    const state = this.conns[name]
+    const header = {}
+
+    // --- Double Ratchet: DH Step ---
+    // If we have no sending chain key (start of session or after receiving a reply),
+    // we initiate a new ratchet step.
+    if (!state.CKs) {
+      // 1. Generate new ephemeral keypair
+      state.DHs = await generateEG()
+
+      // 2. Perform DH calculations
+      if (state.RK === null) {
+        // Initial Session Setup
+        const dh1 = await computeDH(this.EGKeyPair.sec, state.DHr)
+        const dh2 = await computeDH(state.DHs.sec, state.DHr)
+        // Combine them via HKDF (Using standard info string "ratchet-init")
+        // We treat the output of HKDF as [RootKey, ChainKeySending]
+        const kdfOut = await HKDF(dh1, dh2, 'ratchet-init')
+        state.RK = kdfOut[0]
+        state.CKs = kdfOut[1]
+        state.PN = 0
+      } else {
+        // Standard Ratchet Step
+        state.PN = state.Ns // Capture the previous chain length BEFORE resetting Ns
+        const sharedSecret = await computeDH(state.DHs.sec, state.DHr)
+        const kdfOut = await HKDF(state.RK, sharedSecret, 'ratchet-dh')
+        state.RK = kdfOut[0]
+        state.CKs = kdfOut[1]
+      }
+      // Reset sending count for the new chain
+      state.Ns = 0
+    }
+
+    // Populate Header with our current Ratchet Public Key
+    header.dhPub = state.DHs.pub
+    header.N = state.Ns
+    header.PN = state.PN
+
+    // --- Double Ratchet: Symmetric Key Step ---
+    // Derive Message Key (MK) and Next Chain Key (CKs)
+
+    // 1. Derive the actual message key (CryptoKey) for encryption
+    const mk = await HMACtoAESKey(state.CKs, 'ratchet-msg-key')
+
+    // 2. Derive the RAW bytes of the SAME message key for the government
+    const mkRaw = await HMACtoAESKey(state.CKs, 'ratchet-msg-key', true)
+
+    // 3. Advance the sending chain
+    state.CKs = await HMACtoHMACKey(state.CKs, 'ratchet-chain-key')
+    state.Ns++ // Increment Sending Count
+
+    // --- Government Encryption ---
+    // Encrypt the sending key (mkRaw) for the government.
+    const govPair = await generateEG()
+    header.vGov = govPair.pub
+    header.ivGov = genRandomSalt()
+
+    // Generate Gov AES Key
+    const govDH = await computeDH(govPair.sec, this.govPublicKey)
+    const govAESKey = await HMACtoAESKey(govDH, govEncryptionDataStr)
+
+    header.cGov = await encryptWithGCM(
+      govAESKey,
+      mkRaw,
+      header.ivGov
+    )
+
+    // --- Message Encryption ---
+    header.receiverIV = genRandomSalt()
+
+    // Authenticate the header
+    const headerStr = JSON.stringify(header)
+    const ciphertext = await encryptWithGCM(mk, plaintext, header.receiverIV, headerStr)
 
     return [header, ciphertext]
   }
 
   /**
-   * Receive message from `name`. Supports out-of-order delivery by deriving
-   * and storing skipped message keys up to the incoming msgCount.
+   * Decrypt a message received from another user.
    *
-   * Throws on replay or tampering.
+   * Arguments:
+   * name: string
+   * [header, ciphertext]: Tuple of [dictionary, ArrayBuffer]
+   *
+   * Return Type: string
    */
   async receiveMessage (name, [header, ciphertext]) {
-    if (!this.certs[name]) throw new Error('Missing certificate for ' + name)
-    if (!this.EGKeyPair) throw new Error('Local keypair not initialized (call generateCertificate)')
+    if (!this.certs[name]) {
+      throw new Error(`No certificate found for ${name}`)
+    }
 
-    const conn = await this._initConn(name, false)
-
-    // Validate sender
-    if (!header.sender || header.sender !== name) throw new Error('Sender mismatch')
-
-    // Replay detection
-    const ctHash = Buffer.from(ciphertext).toString('hex')
-    if (conn.seen.has(ctHash)) throw new Error('Replay detected')
-
-    // Ensure msgCount exists
-    if (typeof header.msgCount !== 'number') throw new Error('Missing msgCount in header')
-    const incomingIndex = header.msgCount
-
-    // Derive keys for skipped messages if needed.
-    // Use a temporary seed (`tempSeed`) so we only update conn.recvSeed once to the final state.
-    if (incomingIndex >= conn.recvCount) {
-      let tempSeed = conn.recvSeed
-      for (let i = conn.recvCount; i <= incomingIndex; i++) {
-        // derive only if missing
-        if (!conn.skipped.has(i)) {
-          const key = await HMACtoAESKey(tempSeed, `MSG-${i}`)
-          conn.skipped.set(i, key)
-        }
-        // advance tempSeed for next index
-        tempSeed = await HMACtoHMACKey(tempSeed, 'chain')
+    // Initialize session state if it doesn't exist (First message received)
+    if (!this.conns[name]) {
+      const senderCert = this.certs[name]
+      this.conns[name] = {
+        RK: null,
+        CKs: null,
+        CKr: null,
+        DHs: this.EGKeyPair, // My Identity Key (initially)
+        DHr: null, // Will be populated from header
+        Ns: 0,
+        Nr: 0,
+        PN: 0,
+        skippedKeys: {}
       }
-      // commit final seed position
-      conn.recvSeed = tempSeed
+
+      const state = this.conns[name]
+
+      // Perform Initial Handshake logic
+      state.DHr = header.dhPub
+      const dh1 = await computeDH(this.EGKeyPair.sec, senderCert.publicKey)
+      const dh2 = await computeDH(this.EGKeyPair.sec, state.DHr)
+
+      const kdfOut = await HKDF(dh1, dh2, 'ratchet-init')
+      state.RK = kdfOut[0]
+      state.CKr = kdfOut[1]
+      state.Nr = 0
     }
 
-    // Get key for current message
-    const keyForMsg = conn.skipped.get(incomingIndex)
-    if (!keyForMsg) throw new Error('No key available for incoming message index')
+    const state = this.conns[name]
 
-    // Attempt decryption with header-authenticated data JSON.stringify(header)
-    let plaintextBuf
-    try {
-      plaintextBuf = await decryptWithGCM(keyForMsg, ciphertext, header.receiverIV, JSON.stringify(header))
-    } catch (e) {
-      // decryption failure => tampering or wrong key
-      throw new Error('Tampering or wrong recipient')
+    // --- 1. Check for Skipped Keys (Out-of-Order Handling) ---
+    // Before processing, check if we already stored a key for this message
+    const headerDhFingerprint = await this.getFingerprint(header.dhPub)
+    const skipKeyIndex = headerDhFingerprint + '_' + header.N
+
+    if (state.skippedKeys[skipKeyIndex]) {
+      const mk = state.skippedKeys[skipKeyIndex]
+      delete state.skippedKeys[skipKeyIndex]
+      return this.decryptWithKey(mk, header, ciphertext)
     }
 
-    // Successful decrypt: mark seen, mark consumed, remove the consumed skipped key
-    conn.seen.add(ctHash)
-    conn.skipped.delete(incomingIndex)
-    conn.consumed.add(incomingIndex)
-
-    // Advance recvCount only while we've actually consumed that index.
-    // This prevents us from overshooting across ratchet boundaries.
-    while (conn.consumed.has(conn.recvCount)) {
-      // we've consumed this index, so remove marker and bump recvCount
-      conn.consumed.delete(conn.recvCount)
-      conn.recvCount += 1
+    // --- 2. Check for DH Ratchet (Forward chain advancement) ---
+    // Check if the sender has a new ratchet key (indicating a ratchet step)
+    let ratchetNeeded = false
+    if (state.RK !== null) {
+      const existingDhFingerprint = await this.getFingerprint(state.DHr)
+      // If header key is different from what we have, it means they ratcheted
+      if (existingDhFingerprint !== headerDhFingerprint) {
+        ratchetNeeded = true
+      }
     }
 
-    return bufferToString(plaintextBuf)
+    if (ratchetNeeded) {
+      // A. Skip messages in the PREVIOUS chain
+      // header.PN tells us how many messages they sent in the chain we are currently on.
+      // We fast-forward state.Nr up to header.PN to fill in missing keys.
+      if (state.CKr !== null) {
+        await this.skipMessageKeys(state, state.DHr, state.Nr, header.PN)
+      }
+
+      // B. Perform DH Ratchet
+      state.DHr = header.dhPub // Update receiving ratchet key
+      const sharedSecret = await computeDH(state.DHs.sec, state.DHr)
+      const kdfOut = await HKDF(state.RK, sharedSecret, 'ratchet-dh')
+      state.RK = kdfOut[0]
+      state.CKr = kdfOut[1]
+
+      // Reset receiving number for the new chain
+      state.Nr = 0
+
+      // Wipe sending chain because we received a new key; we must reply with a new one.
+      state.CKs = null
+      // FIX: Do NOT reset state.Ns here! We need to preserve it for PN in the next sendMessage.
+    }
+
+    // --- 3. Skip messages in CURRENT chain ---
+    // If header.N is greater than our current state.Nr, we skipped messages in this chain.
+    await this.skipMessageKeys(state, state.DHr, state.Nr, header.N)
+
+    // --- 4. Process the current message ---
+    // Derive MK and next CKr
+    const mk = await HMACtoAESKey(state.CKr, 'ratchet-msg-key')
+    state.CKr = await HMACtoHMACKey(state.CKr, 'ratchet-chain-key')
+    state.Nr++
+
+    return this.decryptWithKey(mk, header, ciphertext)
   }
 
-}
+  /**
+   * Helper: Fast-forward the chain and store keys for skipped messages.
+   */
+  async skipMessageKeys (state, dhPubKey, currentNr, targetNr) {
+    if (currentNr >= targetNr) return
 
-module.exports = { MessengerClient }
+    const dhKeyFingerprint = await this.getFingerprint(dhPubKey)
+
+    // Generate keys for every missed message index
+    for (let i = currentNr; i < targetNr; i++) {
+      const mk = await HMACtoAESKey(state.CKr, 'ratchet-msg-key')
+      state.CKr = await HMACtoHMACKey(state.CKr, 'ratchet-chain-key')
+
+      // Store key
+      const index = dhKeyFingerprint + '_' + i
+      state.skippedKeys[index] = mk
+    }
+    state.Nr = targetNr
+  }
+
+  /**
+   * Helper: Perform decryption with error handling
+   */
+  async decryptWithKey (mk, header, ciphertext) {
+    try {
+      const headerStr = JSON.stringify(header)
+      const plaintextBuffer = await decryptWithGCM(
+        mk,
+        ciphertext,
+        header.receiverIV,
+        headerStr
+      )
+      return bufferToString(plaintextBuffer)
+    } catch (err) {
+      throw new Error('Decryption failed or tampering detected')
+    }
+  }
+};
+
+module.exports = {
+  MessengerClient
+}
