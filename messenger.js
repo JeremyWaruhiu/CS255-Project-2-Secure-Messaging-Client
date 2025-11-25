@@ -59,7 +59,7 @@ class MessengerClient {
     this.EGKeyPair = await generateEG()
 
     const certificate = {
-      username: username,
+      username,
       publicKey: this.EGKeyPair.pub
     }
     return certificate
@@ -281,7 +281,6 @@ class MessengerClient {
 
       // Wipe sending chain because we received a new key; we must reply with a new one.
       state.CKs = null
-      // FIX: Do NOT reset state.Ns here! We need to preserve it for PN in the next sendMessage.
     }
 
     // --- 3. Skip messages in CURRENT chain ---

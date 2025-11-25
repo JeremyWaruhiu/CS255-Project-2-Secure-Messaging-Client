@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SecureSignal Gov Edition</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+    <div class="header">
+        <h1>SecureSignal <span class="gov-badge">Gov Compliant</span></h1>
+        <div id="status">System Status: Online</div>
+    </div>
+
+    <div class="main-container">
+        <div class="phone-wrapper">
+            <div class="phone-header">Alice</div>
+            <div id="chat-alice" class="chat-area"></div>
+            <div class="input-area">
+                <input type="text" id="input-alice" placeholder="Message Bob...">
+                <button onclick="sendMessage('Alice', 'Bob')">Send</button>
+            </div>
+        </div>
+
+        <div class="network-log">
+            <h3>📡 Network / Surveillance Log</h3>
+            <div id="wire-log" class="log-container">
+                <div class="log-entry system">Waiting for traffic...</div>
+            </div>
+        </div>
+
+        <div class="phone-wrapper">
+            <div class="phone-header">Bob</div>
+            <div id="chat-bob" class="chat-area"></div>
+            <div class="input-area">
+                <input type="text" id="input-bob" placeholder="Message Alice...">
+                <button onclick="sendMessage('Bob', 'Alice')">Send</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
